@@ -1,0 +1,4 @@
+interface:
+  display_name: "Web Design"
+  short_description: "Design, build, and visually verify distinctive websites"
+  default_prompt: "Use $web-design to take this site through the brief, design direction, implementation, and rendered review workflow."
