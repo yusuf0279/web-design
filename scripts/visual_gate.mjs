@@ -34,8 +34,20 @@ try {
       const page = await browser.newPage({ viewport: { width: viewport.width, height: viewport.height }, deviceScaleFactor: 1 });
       const runtimeErrors = [];
       page.on("pageerror", error => runtimeErrors.push(error.message));
-      await page.goto(url, { waitUntil: "domcontentloaded", timeout: 45000 });
-      await page.waitForTimeout(350);
+      await page.goto(url, { waitUntil: "load", timeout: 45000 });
+      await page.waitForTimeout(800); // let the framework hydrate so theme toggles and handlers exist
+      // Scroll the whole page once so lazy images load before they are checked for being broken.
+      await page.evaluate(async () => {
+        for (let y = 0; y < document.body.scrollHeight; y += 500) { window.scrollTo(0, y); await new Promise(r => setTimeout(r, 50)); }
+        window.scrollTo(0, 0);
+      });
+      // Force lazy images to load and wait for each to settle (or fail) so "broken" means broken.
+      await page.evaluate(() => Promise.all([...document.images].map(img => {
+        img.loading = "eager";
+        if (img.complete) return null;
+        return new Promise(resolve => { img.addEventListener("load", resolve, { once: true }); img.addEventListener("error", resolve, { once: true }); setTimeout(resolve, 5000); });
+      })));
+      await page.waitForTimeout(300);
 
       let actualTheme = await page.locator("html").evaluate(el => ["light", "dark"].find(theme => el.classList.contains(theme)) || "unknown");
       if (actualTheme !== theme) {
@@ -83,7 +95,30 @@ try {
             }
           }
         }
-        return { overflow, brokenImages, missingAlt, smallText, clipped, title: document.title, h1: document.querySelector("h1")?.innerText || null };
+        // Unintended overlap: content boxes (text blocks, media, controls) that cover each other.
+        // Mark a deliberate, composed overlap with data-overlap="intentional" on either element.
+        const overlaps = [];
+        const label = el => (el.tagName.toLowerCase() + (el.id ? "#" + el.id : "") + (typeof el.className === "string" && el.className ? "." + el.className.trim().split(/\s+/)[0] : "") + (el.textContent.trim() ? ` “${el.textContent.trim().replace(/\s+/g, " ").slice(0, 40)}”` : ""));
+        const boxes = [...document.querySelectorAll("h1,h2,h3,h4,p,li,figcaption,label,button,a,pre,table,img,video,canvas,svg,figure")]
+          .filter(el => shown(el))
+          .filter(el => !el.closest("[data-overlap='intentional']"))
+          .filter(el => !(el.matches("svg") && (el.getBoundingClientRect().width < 48 || el.closest("button,a"))))
+          .filter(el => !el.matches("figure,li") || el.querySelector("img,video,canvas") === null || el.matches("li"))
+          .map(el => ({ el, r: el.getBoundingClientRect(), pos: getComputedStyle(el).position }))
+          .filter(b => !["fixed", "sticky"].includes(b.pos) && !b.el.closest("header"));
+        for (let i = 0; i < boxes.length && overlaps.length < 12; i++) {
+          for (let j = i + 1; j < boxes.length && overlaps.length < 12; j++) {
+            const a = boxes[i], b = boxes[j];
+            if (a.el.contains(b.el) || b.el.contains(a.el)) continue;
+            const w = Math.min(a.r.right, b.r.right) - Math.max(a.r.left, b.r.left);
+            const h = Math.min(a.r.bottom, b.r.bottom) - Math.max(a.r.top, b.r.top);
+            if (w <= 2 || h <= 2) continue;
+            const smaller = Math.min(a.r.width * a.r.height, b.r.width * b.r.height);
+            if (w * h < 0.02 * smaller) continue;
+            overlaps.push(label(a.el) + "  ×  " + label(b.el));
+          }
+        }
+        return { overflow, brokenImages, missingAlt, smallText, clipped, overlaps, title: document.title, h1: document.querySelector("h1")?.innerText || null };
       });
 
       const name = `${viewport.name}-${theme}.png`;
@@ -96,10 +131,26 @@ try {
       if (findings.missingAlt.length) report.failures.push(`${viewport.name}/${theme}: images missing alt attributes: ${findings.missingAlt.join(", ")}`);
       if (findings.smallText.length) report.failures.push(`${viewport.name}/${theme}: text below legibility baseline: ${findings.smallText.map(item => `“${item.text}” (${item.size}px; needs ${item.minimum}px)`).join("; ")}`);
       if (findings.clipped.length) report.failures.push(`${viewport.name}/${theme}: text clipped: ${findings.clipped.map(item => item.text).join("; ")}`);
+      if (findings.overlaps.length) report.failures.push(`${viewport.name}/${theme}: unintended overlap (mark deliberate ones with data-overlap=\"intentional\"): ${findings.overlaps.join(" | ")}`);
       if (runtimeErrors.length) report.failures.push(`${viewport.name}/${theme}: runtime errors: ${runtimeErrors.join("; ")}`);
       await page.close();
     }
   }
+// Favicon: /favicon.ico must be a real ICO, a rel=icon link must exist, and its colour must be reported for a style check.
+try {
+  const origin = new URL(url).origin;
+  const res = await fetch(origin + "/favicon.ico");
+  const buf = Buffer.from(await res.arrayBuffer());
+  const isIco = buf.length > 22 && buf[0] === 0 && buf[1] === 0 && buf[2] === 1 && buf[3] === 0;
+  report.favicon = { status: res.status, bytes: buf.length, validIco: isIco };
+  if (!res.ok || !isIco) report.failures.push(`/favicon.ico is not a valid icon (status ${res.status}, ${buf.length} bytes). Generate a multi-size ICO from the site's real mark and brand colours.`);
+  const probe = await browser.newPage();
+  await probe.goto(url, { waitUntil: "load", timeout: 45000 });
+  const links = await probe.evaluate(() => [...document.querySelectorAll('link[rel~="icon"]')].map(l => l.href));
+  await probe.close();
+  report.favicon.links = links;
+  if (!links.length) report.failures.push("No <link rel=icon> in the page head.");
+} catch (error) { report.failures.push(`favicon check failed: ${error.message}`); }
 } finally {
   await browser.close();
 }
@@ -109,6 +160,7 @@ for (const capture of report.captures) {
   console.log(`${capture.viewport}/${capture.theme}: ${capture.size}; image errors=${capture.brokenImages.length}; missing alt=${capture.missingAlt.length}; small text=${capture.smallText.length}; clipped=${capture.clipped.length}; overflow=${capture.overflow.viewport}; runtime errors=${capture.runtimeErrors.length}`);
   console.log(`  ${path.join(outDir, capture.screenshot)}`);
 }
+if (report.favicon) console.log(`favicon: status=${report.favicon.status}; valid ico=${report.favicon.validIco}; links=${(report.favicon.links||[]).length}`);
 if (report.failures.length) {
   console.error("Visual gate failed:\n- " + report.failures.join("\n- "));
   process.exitCode = 1;
